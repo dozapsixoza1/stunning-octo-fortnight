@@ -32,7 +32,7 @@ from telegram.ext import (
 )
 
 # ===================== НАСТРОЙКИ =====================
-BOT_TOKEN      = "8888151886:AAG5HT_2w21knElyzBI0WakUfNOZTRho_OQ"   # @BotFather
+BOT_TOKEN      = "8888151886:AAG5HT_2w21knElyzBI0WakUfNOZTRho_OQ"
 OWNER_ID       = 8675927241
 GROUP_USERNAME = "chatlancet"
 GROUP_CHAT_ID  = -1003773742747
@@ -90,7 +90,6 @@ def load_balance() -> dict:
     if os.path.exists(BALANCE_FILE):
         with open(BALANCE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    # Файла нет — создаём автоматически
     data = {"balance": 0, "transactions": []}
     save_balance(data)
     return data
@@ -174,7 +173,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.from_user.id != OWNER_ID:
         await msg.reply_text(
             "👋 Привет!\n"
-            "Общайся в нашем чате и получай возможность выиграть *Мишку* от @psychokaratel! 🐻\n\n"
+            "Общайся в нашем чате и получай возможность выиграть *Мишку* от @godlancet! 🐻\n\n"
             "Переходи: @chatlancet",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -495,19 +494,30 @@ async def payout_winner(bot: Bot, user_id: int, stars: int, prize_name: str):
     uname = usernames.get(user_id, str(user_id))
     deduct_balance(stars, winner=f"@{uname}")
 
+    caption = (
+        f"🎉 *Поздравляю!*\n"
+        f"🎁 Ты выиграл *{prize_name}* 🧸 от @godlancet\n"
+        f"✅ Подарок отправлен.\n\n"
+        f"⭐ Тебе начислено: *{stars} звёзд*\n\n"
+        f"‼️ Пишите сообщения в чате, и получайте возможность так же залутать подарки\n\n"
+        f"👾 Так же вы можете выбить мишку у @grith в его чате — @PoseidonsGift"
+    )
     try:
-        await bot.send_message(
+        await bot.send_photo(
             chat_id=user_id,
-            text=(
-                f"🎉 *Поздравляю! Ты победил в ивенте!*\n\n"
-                f"🏆 Приз: *{prize_name}*\n"
-                f"⭐ Тебе начислено: *{stars} звёзд*\n\n"
-                f"Звёзды будут отправлены в течение нескольких минут от @psychokaratel"
-            ),
+            photo="https://i.ibb.co/WN6HrVDx/IMG-20260525-220900-053.jpg",
+            caption=caption,
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
-        pass
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=caption,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
 
     bal = get_balance()
     await bot.send_message(
@@ -599,7 +609,6 @@ async def start_event(bot: Bot, etype: str, prize: str, stars: int = 0):
 
     await send_group(bot, text)
 
-    loop = asyncio.get_event_loop()
     tasks_map = {
         "last_leader":  lambda: run_last_leader(bot, prize, stars),
         "most_active":  lambda: run_timed(bot, prize, stars, 300, mode="active"),
@@ -669,6 +678,25 @@ async def declare_winner(bot: Bot, user_id: int, prize: str, stars: int = 0):
     if stars > 0:
         await payout_winner(bot, user_id, stars, prize)
     else:
+        caption = (
+            f"🎉 *Поздравляю!*\n"
+            f"🎁 Ты выиграл *{prize}* 🧸 от @godlancet\n"
+            f"✅ Подарок отправлен.\n\n"
+            f"‼️ Пишите сообщения в чате, и получайте возможность так же залутать подарки\n\n"
+            f"👾 Так же вы можете выбить мишку у @grith в его чате — @PoseidonsGift"
+        )
+        try:
+            await bot.send_photo(
+                chat_id=user_id,
+                photo="https://i.ibb.co/WN6HrVDx/IMG-20260525-220900-053.jpg",
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            try:
+                await bot.send_message(chat_id=user_id, text=caption, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
         try:
             await bot.send_message(
                 chat_id=OWNER_ID,
@@ -709,9 +737,9 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await msg.reply_text(
                 "Здарова! ⭐\n\n"
-                "Тут ты можешь общаться в комментариях и чате и получить *Мишку* от @psychokaratel 🐻\n\n"
+                "Тут ты можешь общаться в комментариях и чате и получить *Мишку* от @godlancet 🐻\n\n"
                 "Просто общайся и получай возможность залутать Мишку или НФТ ПОДАРОК 🎁\n\n"
-                "Также можешь выбить мишку у @grith в его чате — @podarkikaratel",
+                "Также можешь выбить мишку у @grith в его чате — @PoseidonsGift",
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
@@ -791,7 +819,7 @@ async def owner_pm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def other_pm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет!\n"
-        "Общайся в нашем чате и получай возможность выиграть *Мишку* от @psychokaratel! 🐻\n\n"
+        "Общайся в нашем чате и получай возможность выиграть *Мишку* от @godlancet! 🐻\n\n"
         "Переходи: @chatlancet",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -804,7 +832,6 @@ async def other_pm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Команды
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("balance",  cmd_balance))
     app.add_handler(CommandHandler("history",  cmd_history))
@@ -814,26 +841,21 @@ def main():
     app.add_handler(CommandHandler("announce", cmd_announce))
     app.add_handler(CommandHandler("stats",    cmd_stats))
 
-    # Инлайн-кнопки
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Оплата
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_payment))
 
-    # Группа
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS,
         on_group_message,
     ))
 
-    # ЛС владельца (не команды)
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.User(OWNER_ID) & ~filters.COMMAND,
         owner_pm,
     ))
 
-    # ЛС остальных (не команды)
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.User(OWNER_ID) & ~filters.COMMAND,
         other_pm,
