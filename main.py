@@ -37,6 +37,7 @@ OWNER_ID       = 8675927241
 GROUP_USERNAME = "sexpunisher"
 GROUP_CHAT_ID  = -1004340867881
 BALANCE_FILE   = "balance.json"
+ADMIN_CACHE_TTL_SECONDS = 300  # как часто обновлять список админов группы
 # =====================================================
 
 logging.basicConfig(
@@ -53,6 +54,9 @@ usernames:     dict[int, str] = {}
 pending_prize: str | None = None
 pending_stars: int | None = None
 waiting_custom_topup: bool = False
+
+admin_ids: set[int] = set()
+admin_cache_time: datetime | None = None
 # ─────────────────────────────────────────────────────
 
 STAR_AMOUNTS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
@@ -147,11 +151,14 @@ def mention(user_id: int) -> str:
 
 async def send_group(bot: Bot, text: str):
     target = GROUP_CHAT_ID or f"@{GROUP_USERNAME}"
-    await bot.send_message(
-        chat_id=target,
-        text=text,
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        await bot.send_message(
+            chat_id=target,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        log.warning(f"Не удалось отправить сообщение в группу: {e}")
 
 
 def make_kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -159,6 +166,23 @@ def make_kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=t, callback_data=d) for t, d in row]
         for row in rows
     ])
+
+
+async def get_admin_ids(bot: Bot, chat_id: int) -> set[int]:
+    """Возвращает id админов группы, кэшируя на ADMIN_CACHE_TTL_SECONDS,
+    чтобы не дёргать Telegram API на каждое сообщение."""
+    global admin_ids, admin_cache_time
+    now = datetime.now()
+    if admin_cache_time and (now - admin_cache_time).total_seconds() < ADMIN_CACHE_TTL_SECONDS and admin_ids:
+        return admin_ids
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        admin_ids = {a.user.id for a in admins}
+        admin_cache_time = now
+    except Exception as e:
+        log.warning(f"Не удалось получить список админов: {e}")
+        # если запрос не удался, а старый список пустой — не блокируем работу бота
+    return admin_ids
 
 
 # ══════════════════════════════════════════════════════
@@ -519,18 +543,21 @@ async def payout_winner(bot: Bot, user_id: int, stars: int, prize_name: str):
             pass
 
     bal = get_balance()
-    await bot.send_message(
-        chat_id=OWNER_ID,
-        text=(
-            f"📤 *Выплата победителю*\n\n"
-            f"👤 Победитель: {mention(user_id)}\n"
-            f"⭐ Отправь: *{stars} звёзд*\n"
-            f"🎁 Приз: {prize_name}\n\n"
-            f"💰 Остаток баланса: *{bal} ⭐*\n\n"
-            f"Нажми на имя пользователя и отправь ему {stars}⭐ через Telegram"
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        await bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                f"📤 *Выплата победителю*\n\n"
+                f"👤 Победитель: {mention(user_id)}\n"
+                f"⭐ Отправь: *{stars} звёзд*\n"
+                f"🎁 Приз: {prize_name}\n\n"
+                f"💰 Остаток баланса: *{bal} ⭐*\n\n"
+                f"Нажми на имя пользователя и отправь ему {stars}⭐ через Telegram"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        log.warning(f"Не удалось уведомить владельца о выплате: {e}")
 
 
 # ══════════════════════════════════════════════════════
@@ -736,7 +763,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(
                 "Здарова! ⭐\n\n"
                 "Тут ты можешь общаться в комментариях и чате и получить *Мишку* от @godlancet 🐻\n\n"
-                "Просто общайся и получай возможность залутать Мишку или НФТ ПОДАРОК 🎁\n\n"
+                "Просто общайся и получай возможность залутать Мишку или НФТ ПОДАРОК 🎁",
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
@@ -752,6 +779,11 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not active_event:
         return
 
+    # ── Админы не участвуют в ивентах и не могут получить подарок за сообщения ──
+    admins = await get_admin_ids(context.bot, msg.chat.id)
+    if user.id in admins:
+        return
+
     msg_counts[user.id] += 1
     etype = active_event["type"]
 
@@ -764,6 +796,12 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_group(
                     context.bot,
                     f"🔄 *Перебито!*\n\nНовый лидер: {mention(user.id)}. До конца: 3 мин.",
+                )
+            else:
+                await send_group(
+                    context.bot,
+                    f"👑 *Лидер захвачен!*\n\n{mention(user.id)} держит лидерство. "
+                    f"Продержись 3 мин без перебива, чтобы победить!",
                 )
     elif etype == "first_sticker" and msg.sticker:
         await declare_winner(context.bot, user.id, active_event["prize"], active_event.get("stars", 0))
