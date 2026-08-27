@@ -34,8 +34,8 @@ from telegram.ext import (
 # ===================== НАСТРОЙКИ =====================
 BOT_TOKEN      = "8888151886:AAG5HT_2w21knElyzBI0WakUfNOZTRho_OQ"
 OWNER_ID       = 8675927241
-GROUP_USERNAME = "chatlancet"
-GROUP_CHAT_ID  = -1003773742747
+GROUP_USERNAME = "sexpunisher"
+GROUP_CHAT_ID  = -1004340867881
 BALANCE_FILE   = "balance.json"
 # =====================================================
 
@@ -496,11 +496,10 @@ async def payout_winner(bot: Bot, user_id: int, stars: int, prize_name: str):
 
     caption = (
         f"🎉 *Поздравляю!*\n"
-        f"🎁 Ты выиграл *{prize_name}* 🧸 от @godlancet\n"
+        f"🎁 Ты выиграл *{prize_name}* 🧸 от @hufody\n"
         f"✅ Подарок отправлен.\n\n"
         f"⭐ Тебе начислено: *{stars} звёзд*\n\n"
         f"‼️ Пишите сообщения в чате, и получайте возможность так же залутать подарки\n\n"
-        f"👾 Так же вы можете выбить мишку у @grith в его чате — @PoseidonsGift"
     )
     try:
         await bot.send_photo(
@@ -683,7 +682,6 @@ async def declare_winner(bot: Bot, user_id: int, prize: str, stars: int = 0):
             f"🎁 Ты выиграл *{prize}* 🧸 от @godlancet\n"
             f"✅ Подарок отправлен.\n\n"
             f"‼️ Пишите сообщения в чате, и получайте возможность так же залутать подарки\n\n"
-            f"👾 Так же вы можете выбить мишку у @grith в его чате — @PoseidonsGift"
         )
         try:
             await bot.send_photo(
@@ -739,7 +737,6 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Здарова! ⭐\n\n"
                 "Тут ты можешь общаться в комментариях и чате и получить *Мишку* от @godlancet 🐻\n\n"
                 "Просто общайся и получай возможность залутать Мишку или НФТ ПОДАРОК 🎁\n\n"
-                "Также можешь выбить мишку у @grith в его чате — @PoseidonsGift",
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
