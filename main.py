@@ -27,7 +27,7 @@ from aiogram.types import (
 #
 # REQUIRED ENV:
 #   BOT_TOKEN=8650738832:AAEd6RIeS-lDFJH99t3KkjE_jymKiIS7aQE
-#   WEBAPP_URL=https://bot-1790185762-6559-wave-dipsize.bothost.tech
+#   WEBAPP_URL=https://bot-1790200911-5714-wave-dipsize.bothost.tech
 #   MASTER_OWNER_ID=8302336447
 #
 # OPTIONAL:
@@ -42,7 +42,7 @@ from aiogram.types import (
 # ============================================================
 
 BOT_TOKEN = "8650738832:AAEd6RIeS-lDFJH99t3KkjE_jymKiIS7aQE"
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bot-1790185762-6559-wave-dipsize.bothost.tech").rstrip("/")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bot-1790200911-5714-wave-dipsize.bothost.tech").rstrip("/")
 MASTER_OWNER_ID = 76222784
 DEVELOPER_ID = 8302336447
 WEB_HOST = "0.0.0.0"
