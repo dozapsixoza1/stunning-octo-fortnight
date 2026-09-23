@@ -32,10 +32,10 @@ from telegram.ext import (
 )
 
 # ===================== НАСТРОЙКИ =====================
-BOT_TOKEN      = "8888151886:AAENI5rDl_1k02zUfjbwJQoA1JBEkvkc2Rk"
-OWNER_ID       = 8675927241
-GROUP_USERNAME = "sexpunisher"
-GROUP_CHAT_ID  = -1004340867881
+BOT_TOKEN      = "8746595925:AAFo6L47PQAd98O0vYPLSHihB2D4zPnBqv4"
+OWNER_ID       = 8302336447
+GROUP_USERNAME = "ludkakara"
+GROUP_CHAT_ID  = -1003923983192
 BALANCE_FILE   = "balance.json"
 ADMIN_CACHE_TTL_SECONDS = 300  # как часто обновлять список админов группы
 # =====================================================
