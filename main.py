@@ -1,904 +1,896 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Бот для раздачи подарков и ивентов
-Фреймворк: python-telegram-bot 20.x (PTB)
-"""
-
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
-import random
-from collections import defaultdict
-from datetime import datetime
+import secrets
+import string
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional
 
-from telegram import (
-    Bot,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LabeledPrice,
-    Update,
-)
-from telegram.constants import ChatType, ParseMode
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    PreCheckoutQueryHandler,
-    filters,
+import aiosqlite
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    Message, LabeledPrice, PreCheckoutQuery, ChatMemberUpdated,
+    WebAppInfo, ReplyKeyboardMarkup, KeyboardButton,
 )
 
-# ===================== НАСТРОЙКИ =====================
-BOT_TOKEN      = "8746595925:AAFo6L47PQAd98O0vYPLSHihB2D4zPnBqv4"
-OWNER_ID       = 8302336447
-GROUP_USERNAME = "ludkakara"
-GROUP_CHAT_ID  = -1003923983192
-BALANCE_FILE   = "balance.json"
-ADMIN_CACHE_TTL_SECONDS = 300  # как часто обновлять список админов группы
-# =====================================================
+# ============================================================
+# OTDEL — bot + Mini App in ONE Python file.
+#
+# REQUIRED ENV:
+#   BOT_TOKEN=8650738832:AAEd6RIeS-lDFJH99t3KkjE_jymKiIS7aQE
+#   WEBAPP_URL=https://bot-1790185762-6559-wave-dipsize.bothost.tech
+#   MASTER_OWNER_ID=8302336447
+#
+# OPTIONAL:
+#   WEB_HOST=0.0.0.0
+#   WEB_PORT=8080
+#   DB_PATH=otdel.db
+#
+# IMPORTANT:
+# The Telegram bot token that was pasted into the previous code
+# should be revoked in @BotFather and replaced with a new token.
+# Never publish the token in HTML/JS or GitHub.
+# ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-log = logging.getLogger(__name__)
+BOT_TOKEN = "8650738832:AAEd6RIeS-lDFJH99t3KkjE_jymKiIS7aQE"
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bot-1790185762-6559-wave-dipsize.bothost.tech").rstrip("/")
+MASTER_OWNER_ID = 76222784
+DEVELOPER_ID = 8302336447
+WEB_HOST = "0.0.0.0"
+WEB_PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))
+DB_PATH = "otdel.db"
+STATIC_DIR = Path(__file__).parent
 
-# ─── Глобальное состояние ────────────────────────────
-active_event:  dict | None = None
-event_task:    asyncio.Task | None = None
-msg_counts     = defaultdict(int)
-usernames:     dict[int, str] = {}
-pending_prize: str | None = None
-pending_stars: int | None = None
-waiting_custom_topup: bool = False
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
+if not MASTER_OWNER_ID:
+    raise RuntimeError("MASTER_OWNER_ID is not set")
 
-admin_ids: set[int] = set()
-admin_cache_time: datetime | None = None
-# ─────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("otdel")
 
-STAR_AMOUNTS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
-EVENT_TYPES = [
-    ("last_leader",   "👑 Последний лидер (3 мин без перебива)"),
-    ("most_active",   "💬 Самый активный (5 мин)"),
-    ("random_win",    "🎲 Случайный победитель"),
-    ("first_sticker", "🎯 Первый стикер"),
-    ("x2_stars",      "⭐ X2 звёзды (15 мин)"),
-    ("quiz",          "🧠 Викторина"),
-    ("lottery",       "🎟 Лотерея (5 мин)"),
-    ("reaction_win",  "❤️ Больше активности"),
-]
+SHOP = {
+    "prefix": ("Префикс в чате", 50),
+    "title": ("Название чата", 80),
+    "desc": ("Описание чата", 60),
+    "photo": ("Фото чата", 70),
+    "tag": ("Тэг в чате", 100),
+    "freezebuy": ("Заморозка чата", 150),
+    "banbuy": ("Бан пользователя", 120),
+    "mutebuy": ("Мут пользователя", 90),
+}
 
-QUIZ_QUESTIONS = [
-    ("Сколько будет 7 × 8?", "56"),
-    ("Столица России?", "москва"),
-    ("Сколько дней в году?", "365"),
-    ("Сколько цветов у радуги?", "7"),
-    ("Как называется наша планета?", "земля"),
-    ("Сколько минут в часе?", "60"),
-    ("В каком году основан Telegram?", "2013"),
-    ("Сколько букв в русском алфавите?", "33"),
-    ("Сколько секунд в минуте?", "60"),
-    ("Первый президент России?", "ельцин"),
-]
-
-
-# ══════════════════════════════════════════════════════
-#  Баланс
-# ══════════════════════════════════════════════════════
-
-def load_balance() -> dict:
-    if os.path.exists(BALANCE_FILE):
-        with open(BALANCE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    data = {"balance": 0, "transactions": []}
-    save_balance(data)
-    return data
+RENT_DAYS = {
+    "30": 30,
+    "90": 90,
+    "365": 365,
+}
 
 
-def save_balance(data: dict):
-    with open(BALANCE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+# ------------------------- DB -------------------------
+
+async def db():
+    return aiosqlite.connect(DB_PATH)
 
 
-def get_balance() -> int:
-    return load_balance()["balance"]
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            photo_url TEXT,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS chats(
+            chat_id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            owner_id INTEGER NOT NULL,
+            added_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS rentals(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            owner_id INTEGER,
+            days INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            activated_at TEXT,
+            expires_at TEXT,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS members(
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            last_seen TEXT NOT NULL,
+            PRIMARY KEY(chat_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS warnings(
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(chat_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS purchases(
+            payload TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            item_id TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            paid INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS settings(
+            chat_id INTEGER PRIMARY KEY,
+            prefix TEXT DEFAULT '',
+            tag TEXT DEFAULT ''
+        );
+        """)
+        await conn.commit()
 
 
-def add_balance(amount: int, note: str = ""):
-    data = load_balance()
-    data["balance"] += amount
-    data["transactions"].append({
-        "type": "topup",
-        "amount": amount,
-        "note": note,
-        "time": datetime.now().isoformat(),
-    })
-    save_balance(data)
-
-
-def deduct_balance(amount: int, winner: str = ""):
-    data = load_balance()
-    data["balance"] -= amount
-    data["transactions"].append({
-        "type": "payout",
-        "amount": amount,
-        "winner": winner,
-        "time": datetime.now().isoformat(),
-    })
-    save_balance(data)
-
-
-# ══════════════════════════════════════════════════════
-#  Утилиты
-# ══════════════════════════════════════════════════════
-
-def is_allowed_chat(chat_id: int, username: str | None) -> bool:
-    if GROUP_CHAT_ID and chat_id == GROUP_CHAT_ID:
-        return True
-    if username and username.lower() == GROUP_USERNAME.lower():
-        return True
-    return False
-
-
-def mention(user_id: int) -> str:
-    uname = usernames.get(user_id)
-    return f"@{uname}" if uname else f"[пользователь](tg://user?id={user_id})"
-
-
-async def send_group(bot: Bot, text: str):
-    target = GROUP_CHAT_ID or f"@{GROUP_USERNAME}"
-    try:
-        await bot.send_message(
-            chat_id=target,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
+async def upsert_user(user: dict):
+    uid = int(user["id"])
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            """INSERT INTO users(user_id,username,first_name,last_name,photo_url,first_seen,last_seen)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+               username=excluded.username, first_name=excluded.first_name,
+               last_name=excluded.last_name, photo_url=excluded.photo_url,
+               last_seen=excluded.last_seen""",
+            (uid, user.get("username"), user.get("first_name"),
+             user.get("last_name"), user.get("photo_url"), now, now),
         )
+        await conn.commit()
+
+
+async def has_access(user_id: int) -> bool:
+    # Главный владелец и разработчик имеют служебный доступ без аренды.
+    if user_id in (MASTER_OWNER_ID, DEVELOPER_ID):
+        return True
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            """SELECT 1 FROM rentals
+               WHERE owner_id=? AND active=1 AND expires_at IS NOT NULL AND expires_at > ?
+               LIMIT 1""",
+            (user_id, now),
+        )
+        return await cur.fetchone() is not None
+
+
+async def get_rental(user_id: int):
+    if user_id == MASTER_OWNER_ID:
+        return {"master": True, "developer": False, "days_left": None, "expires_at": None}
+    if user_id == DEVELOPER_ID:
+        return {"master": False, "developer": True, "days_left": None, "expires_at": None}
+    now = datetime.now(timezone.utc)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            """SELECT expires_at, days FROM rentals
+               WHERE owner_id=? AND active=1
+               ORDER BY expires_at DESC LIMIT 1""",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+    if not row or not row[0]:
+        return None
+    exp = datetime.fromisoformat(row[0])
+    seconds = max(0, int((exp - now).total_seconds()))
+    return {
+        "master": False,
+        "days_left": seconds // 86400 + (1 if seconds % 86400 else 0),
+        "expires_at": row[0],
+        "days": row[1],
+    }
+
+
+async def save_chat(chat_id: int, title: str, owner_id: int):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            """INSERT INTO chats(chat_id,title,owner_id,added_at)
+               VALUES(?,?,?,?)
+               ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, owner_id=excluded.owner_id""",
+            (chat_id, title, owner_id, datetime.now(timezone.utc).isoformat()),
+        )
+        await conn.commit()
+
+
+async def remove_chat(chat_id: int):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
+        await conn.commit()
+
+
+async def get_owner_chats(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        if user_id in (MASTER_OWNER_ID, DEVELOPER_ID):
+            cur = await conn.execute("SELECT chat_id,title,owner_id FROM chats ORDER BY title")
+        else:
+            cur = await conn.execute("SELECT chat_id,title,owner_id FROM chats WHERE owner_id=? ORDER BY title", (user_id,))
+        rows = await cur.fetchall()
+    return [{"id": str(r[0]), "name": r[1], "role": ("Сервис" if user_id in (MASTER_OWNER_ID, DEVELOPER_ID) else "Владелец")} for r in rows]
+
+
+async def owns_chat(user_id: int, chat_id: int) -> bool:
+    if user_id in (MASTER_OWNER_ID, DEVELOPER_ID):
+        return True
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT 1 FROM chats WHERE chat_id=? AND owner_id=?",
+            (chat_id, user_id),
+        )
+        return await cur.fetchone() is not None
+
+
+async def remember_member(message: Message):
+    if not message.from_user or not message.chat:
+        return
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            """INSERT INTO members(chat_id,user_id,username,first_name,last_seen)
+               VALUES(?,?,?,?,?)
+               ON CONFLICT(chat_id,user_id) DO UPDATE SET
+               username=excluded.username, first_name=excluded.first_name,
+               last_seen=excluded.last_seen""",
+            (
+                message.chat.id,
+                message.from_user.id,
+                message.from_user.username,
+                message.from_user.first_name,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        await conn.commit()
+
+
+async def resolve_target(chat_id: int, raw: str) -> Optional[int]:
+    raw = (raw or "").strip()
+    if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+        return int(raw)
+    username = raw.lstrip("@").lower()
+    if not username:
+        return None
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT user_id FROM members WHERE chat_id=? AND lower(username)=? LIMIT 1",
+            (chat_id, username),
+        )
+        row = await cur.fetchone()
+    return int(row[0]) if row else None
+
+
+# ------------------------- Telegram WebApp auth -------------------------
+
+def validate_init_data(init_data: str) -> dict:
+    if not init_data:
+        raise ValueError("Нет Telegram initData")
+
+    from urllib.parse import parse_qsl
+    pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+    received_hash = pairs.pop("hash", None)
+    if not received_hash:
+        raise ValueError("Нет hash")
+
+    data_check_string = "\n".join(
+        f"{k}={pairs[k]}" for k in sorted(pairs)
+    )
+    secret = hmac.new(
+        b"WebAppData",
+        BOT_TOKEN.encode(),
+        hashlib.sha256,
+    ).digest()
+    calculated = hmac.new(
+        secret,
+        data_check_string.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(calculated, received_hash):
+        raise ValueError("Неверная подпись Telegram")
+
+    auth_date = int(pairs.get("auth_date", "0") or 0)
+    if not auth_date or time.time() - auth_date > 86400:
+        raise ValueError("initData устарел")
+
+    user = json.loads(pairs.get("user", "{}"))
+    if not user.get("id"):
+        raise ValueError("Пользователь Telegram не найден")
+    return {"user": user, "raw": pairs}
+
+
+async def web_user(request: web.Request):
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    try:
+        auth = validate_init_data(init_data)
+        await upsert_user(auth["user"])
+        return auth
     except Exception as e:
-        log.warning(f"Не удалось отправить сообщение в группу: {e}")
+        raise web.HTTPUnauthorized(text=str(e))
 
 
-def make_kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(text=t, callback_data=d) for t, d in row]
-        for row in rows
+async def require_access(request: web.Request):
+    auth = await web_user(request)
+    user_id = int(auth["user"]["id"])
+    if not await has_access(user_id):
+        raise web.HTTPForbidden(
+            text=json.dumps({
+                "ok": False,
+                "error": "RENT_REQUIRED",
+                "message": "Доступ к OTDEL доступен только по активной аренде."
+            }, ensure_ascii=False),
+            content_type="application/json",
+        )
+    return auth
+
+
+# ------------------------- Bot keyboards -------------------------
+
+def main_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[
+            KeyboardButton(
+                text="🎛 Открыть OTDEL",
+                web_app=WebAppInfo(url=WEBAPP_URL),
+            )
+        ]],
+        resize_keyboard=True,
+    )
+
+
+def rental_kb():
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ 30 дней", callback_data="rent:30"),
+            InlineKeyboardButton(text="➕ 90 дней", callback_data="rent:90"),
+        ],
+        [InlineKeyboardButton(text="➕ 365 дней", callback_data="rent:365")],
+        [InlineKeyboardButton(text="📋 Активные аренды", callback_data="rent:list")],
     ])
 
 
-async def get_admin_ids(bot: Bot, chat_id: int) -> set[int]:
-    """Возвращает id админов группы, кэшируя на ADMIN_CACHE_TTL_SECONDS,
-    чтобы не дёргать Telegram API на каждое сообщение."""
-    global admin_ids, admin_cache_time
-    now = datetime.now()
-    if admin_cache_time and (now - admin_cache_time).total_seconds() < ADMIN_CACHE_TTL_SECONDS and admin_ids:
-        return admin_ids
-    try:
-        admins = await bot.get_chat_administrators(chat_id)
-        admin_ids = {a.user.id for a in admins}
-        admin_cache_time = now
-    except Exception as e:
-        log.warning(f"Не удалось получить список админов: {e}")
-        # если запрос не удался, а старый список пустой — не блокируем работу бота
-    return admin_ids
+def code_kb(code: str):
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Скопировать код", copy_text=None)]
+    ])
 
 
-# ══════════════════════════════════════════════════════
-#  /start
-# ══════════════════════════════════════════════════════
+# ------------------------- Start / rental -------------------------
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg.chat.type != ChatType.PRIVATE:
-        return
-
-    if msg.from_user.id != OWNER_ID:
-        await msg.reply_text(
-            "👋 Привет!\n"
-            "Общайся в нашем чате и получай возможность выиграть *Мишку* от @godlancet! 🐻\n\n"
-            "Переходи: @chatlancet",
-            parse_mode=ParseMode.MARKDOWN,
+@dp.message(CommandStart())
+async def on_start(message: Message):
+    if message.from_user:
+        await upsert_user({"id":message.from_user.id,"username":message.from_user.username,"first_name":message.from_user.first_name,"last_name":message.from_user.last_name,"photo_url":None})
+    if await has_access(message.from_user.id):
+        rental = await get_rental(message.from_user.id)
+        suffix = (
+            "Главный владелец"
+            if rental and rental.get("master")
+            else f"Активная аренда: {rental['days_left']} дн."
         )
-        return
-
-    bal = get_balance()
-    await msg.reply_text(
-        "👑 *Панель владельца*\n\n"
-        f"💰 Баланс бота: *{bal} ⭐*\n\n"
-        "Команды:\n"
-        "/balance — текущий баланс\n"
-        "/topup — пополнить баланс звёздами\n"
-        "/event `<приз>` — запустить ивент\n"
-        "/stop — остановить ивент\n"
-        "/announce `<текст>` — анонс в группу\n"
-        "/stats — статистика ивента\n"
-        "/history — история транзакций\n\n"
-        "Или просто пришли текст приза — спрошу тип ивента 🎯",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        await message.answer(
+            f"👑 <b>OTDEL</b>\n\n"
+            f"Панель управления Telegram-чатами.\n"
+            f"Статус: <b>{suffix}</b>\n\n"
+            f"Открывай Mini App кнопкой ниже.",
+            reply_markup=main_kb(),
+        )
+    else:
+        await message.answer(
+            "🔒 <b>OTDEL</b>\n\n"
+            "Доступ к Mini App выдаётся только по активной аренде.\n\n"
+            "Если у тебя уже есть код аренды — отправь:\n"
+            "<code>/rent КОД</code>\n\n"
+            "После активации снова нажми /start."
+        )
 
 
-# ══════════════════════════════════════════════════════
-#  /balance
-# ══════════════════════════════════════════════════════
-
-async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type != ChatType.PRIVATE or update.message.from_user.id != OWNER_ID:
-        return
-    bal = get_balance()
-    await update.message.reply_text(
-        f"💰 *Баланс бота*\n\n"
-        f"⭐ Доступно: *{bal} звёзд*\n\n"
-        f"{'✅ Достаточно для выдачи призов.' if bal >= 10 else '❌ Пополни баланс — /topup'}",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-# ══════════════════════════════════════════════════════
-#  /history
-# ══════════════════════════════════════════════════════
-
-async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type != ChatType.PRIVATE or update.message.from_user.id != OWNER_ID:
-        return
-    data = load_balance()
-    txs = data.get("transactions", [])[-10:]
-    if not txs:
-        await update.message.reply_text("📋 История пуста.")
-        return
-    lines = []
-    for t in reversed(txs):
-        dt = t["time"][:16].replace("T", " ")
-        if t["type"] == "topup":
-            lines.append(f"➕ +{t['amount']}⭐ — {t.get('note', '')} [{dt}]")
+@dp.message(Command("rent"))
+async def activate_rent(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        if message.from_user.id == MASTER_OWNER_ID:
+            await message.answer(
+                "👑 <b>Управление арендой</b>\n\n"
+                "Создай код для клиента:",
+                reply_markup=rental_kb(),
+            )
         else:
-            lines.append(f"➖ -{t['amount']}⭐ → {t.get('winner', '?')} [{dt}]")
-    await update.message.reply_text(
-        "📋 *Последние транзакции:*\n\n" + "\n".join(lines),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-# ══════════════════════════════════════════════════════
-#  /topup
-# ══════════════════════════════════════════════════════
-
-async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type != ChatType.PRIVATE or update.message.from_user.id != OWNER_ID:
+            await message.answer("Использование: <code>/rent КОД</code>")
         return
 
-    rows = []
-    row = []
-    for i, amount in enumerate(STAR_AMOUNTS):
-        row.append((f"⭐ {amount}", f"topup:{amount}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([("✏️ Своя сумма", "topup:custom")])
-
-    bal = get_balance()
-    await update.message.reply_text(
-        f"💰 *Пополнение баланса*\n\n"
-        f"Текущий баланс: *{bal} ⭐*\n\n"
-        "Выбери сколько звёзд пополнить:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=make_kb(rows),
-    )
-
-
-# ══════════════════════════════════════════════════════
-#  /event
-# ══════════════════════════════════════════════════════
-
-async def cmd_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global pending_prize
-    msg = update.message
-    if msg.chat.type != ChatType.PRIVATE or msg.from_user.id != OWNER_ID:
+    code = parts[1].strip().upper()
+    if message.from_user.id == MASTER_OWNER_ID:
+        await message.answer("Главному владельцу код аренды не нужен.")
         return
 
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.reply_text("Укажи приз: `/event Eternal Rose #6198`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    pending_prize = args[1]
-    await ask_prize_stars(msg)
-
-
-async def ask_prize_stars(msg):
-    bal = get_balance()
-    rows = []
-    row = []
-    for amount in STAR_AMOUNTS:
-        emoji = "✅" if bal >= amount else "❌"
-        row.append((f"{emoji} {amount}⭐", f"pstars:{amount}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([("🎁 Без звёздного приза", "pstars:0")])
-
-    await msg.reply_text(
-        f"⭐ *Сколько звёзд получит победитель?*\n\n"
-        f"💰 Баланс бота: *{bal} ⭐*\n"
-        f"✅ — хватает   ❌ — недостаточно",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=make_kb(rows),
-    )
-
-
-# ══════════════════════════════════════════════════════
-#  /stop
-# ══════════════════════════════════════════════════════
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg.chat.type != ChatType.PRIVATE or msg.from_user.id != OWNER_ID:
-        return
-    if not active_event:
-        await msg.reply_text("❌ Нет активного ивента.")
-        return
-    kb = make_kb([[("✅ Да, стоп", "stop_yes"), ("❌ Отмена", "stop_no")]])
-    await msg.reply_text("Остановить текущий ивент?", reply_markup=kb)
-
-
-# ══════════════════════════════════════════════════════
-#  /announce
-# ══════════════════════════════════════════════════════
-
-async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg.chat.type != ChatType.PRIVATE or msg.from_user.id != OWNER_ID:
-        return
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.reply_text("Использование: `/announce текст`", parse_mode=ParseMode.MARKDOWN)
-        return
-    await send_group(context.bot, args[1])
-    await msg.reply_text("✅ Отправлено в группу.")
-
-
-# ══════════════════════════════════════════════════════
-#  /stats
-# ══════════════════════════════════════════════════════
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg.chat.type != ChatType.PRIVATE or msg.from_user.id != OWNER_ID:
-        return
-    if not active_event:
-        await msg.reply_text("Нет активного ивента.")
-        return
-    elapsed = int((datetime.now() - active_event["started_at"]).total_seconds())
-    top = sorted(msg_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-    top_text = "\n".join(
-        f"{i+1}. {mention(uid)}: {cnt} сообщений"
-        for i, (uid, cnt) in enumerate(top)
-    ) or "Пока никто не написал"
-    await msg.reply_text(
-        f"📊 *Статистика ивента*\n"
-        f"Тип: {dict(EVENT_TYPES).get(active_event['type'], '?')}\n"
-        f"Приз: {active_event['prize']}\n"
-        f"⭐ Звёзды победителю: {active_event.get('stars', 0)}\n"
-        f"Прошло: {elapsed // 60} мин {elapsed % 60} сек\n\n"
-        f"🏆 Топ:\n{top_text}",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-# ══════════════════════════════════════════════════════
-#  Callbacks
-# ══════════════════════════════════════════════════════
-
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global pending_prize, pending_stars, waiting_custom_topup
-
-    cb = update.callback_query
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("❌ Нет доступа.")
-        return
-
-    data = cb.data
-    await cb.answer()
-
-    # ── Пополнение ────────────────────────────────────
-    if data.startswith("topup:"):
-        amount_str = data[6:]
-        if amount_str == "custom":
-            waiting_custom_topup = True
-            await cb.message.edit_text("✏️ Введи сумму пополнения (число звёзд):")
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT id,days,owner_id,expires_at,active FROM rentals WHERE code=?",
+            (code,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            await message.answer("❌ Код не найден.")
+            return
+        rid, days, owner_id, expires_at, active = row
+        if not active:
+            await message.answer("❌ Этот код уже отключён.")
+            return
+        if owner_id and owner_id != message.from_user.id:
+            await message.answer("❌ Код уже активирован другим пользователем.")
             return
 
-        amount = int(amount_str)
-        await cb.message.edit_text(f"💳 Создаю счёт на *{amount} ⭐*...", parse_mode=ParseMode.MARKDOWN)
-        try:
-            await context.bot.send_invoice(
-                chat_id=OWNER_ID,
-                title="Пополнение баланса бота",
-                description=f"Пополнение на {amount} звёзд для выдачи призов",
-                payload=f"topup_{amount}",
-                currency="XTR",
-                prices=[LabeledPrice(label=f"{amount} звёзд", amount=amount)],
-            )
-        except Exception as e:
-            await cb.message.reply_text(f"❌ Ошибка создания счёта: {e}")
-        return
+        now = datetime.now(timezone.utc)
+        if expires_at and datetime.fromisoformat(expires_at) > now:
+            new_exp = datetime.fromisoformat(expires_at) + timedelta(days=days)
+        else:
+            new_exp = now + timedelta(days=days)
 
-    # ── Выбор звёзд для приза ─────────────────────────
-    if data.startswith("pstars:"):
-        pending_stars = int(data[7:])
-        await cb.message.edit_text(
-            f"🎁 Приз: *{pending_prize}*\n"
-            f"⭐ Звёзды победителю: *{pending_stars if pending_stars else 'без звёзд'}*\n\n"
-            "Выбери тип ивента:",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        kb = make_kb([[(label, f"etype:{code}")] for code, label in EVENT_TYPES])
-        await cb.message.reply_text(
-            "🎮 Выбери тип ивента:",
-            reply_markup=kb,
-        )
-        return
-
-    # ── Тип ивента ────────────────────────────────────
-    if data.startswith("etype:"):
-        etype  = data[6:]
-        prize  = pending_prize or "???"
-        stars  = pending_stars or 0
-        pending_prize = None
-        pending_stars = None
-        bal = get_balance()
-
-        if stars > 0 and bal < stars:
-            await cb.message.edit_text(
-                f"❌ *Недостаточно звёзд!*\n\n"
-                f"Нужно: {stars}⭐\n"
-                f"На балансе: {bal}⭐\n\n"
-                f"Пополни баланс: /topup",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-
-        await cb.message.edit_text(
-            f"🚀 Запускаю ивент «{prize}» ({stars}⭐)...",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        await start_event(context.bot, etype, prize, stars)
-        return
-
-    # ── Стоп ──────────────────────────────────────────
-    if data == "stop_yes":
-        await stop_event(context.bot)
-        await cb.message.edit_text("✅ Ивент остановлен.")
-        return
-
-    if data == "stop_no":
-        await cb.message.edit_text("Отмена.")
-        return
-
-
-# ══════════════════════════════════════════════════════
-#  Pre-checkout & успешная оплата
-# ══════════════════════════════════════════════════════
-
-async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.pre_checkout_query.answer(ok=True)
-
-
-async def on_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg.from_user.id != OWNER_ID:
-        return
-    payment = msg.successful_payment
-    amount  = payment.total_amount
-    payload = payment.invoice_payload
-
-    add_balance(amount, note=f"invoice: {payload}")
-    bal = get_balance()
-
-    await msg.reply_text(
-        f"✅ *Баланс пополнен!*\n\n"
-        f"➕ Зачислено: *{amount} ⭐*\n"
-        f"💰 Новый баланс: *{bal} ⭐*",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    log.info(f"Баланс пополнен на {amount} звёзд. Итого: {bal}")
-
-
-# ══════════════════════════════════════════════════════
-#  Выдача звёзд победителю
-# ══════════════════════════════════════════════════════
-
-async def payout_winner(bot: Bot, user_id: int, stars: int, prize_name: str):
-    uname = usernames.get(user_id, str(user_id))
-    deduct_balance(stars, winner=f"@{uname}")
-
-    caption = (
-        f"🎉 *Поздравляю!*\n"
-        f"🎁 Ты выиграл *{prize_name}* 🧸 от @hufody\n"
-        f"✅ Подарок отправлен.\n\n"
-        f"⭐ Тебе начислено: *{stars} звёзд*\n\n"
-        f"‼️ Пишите сообщения в чате, и получайте возможность так же залутать подарки\n\n"
-    )
-    try:
-        await bot.send_photo(
-            chat_id=user_id,
-            photo="https://i.ibb.co/WN6HrVDx/IMG-20260525-220900-053.jpg",
-            caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception:
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=caption,
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            pass
-
-    bal = get_balance()
-    try:
-        await bot.send_message(
-            chat_id=OWNER_ID,
-            text=(
-                f"📤 *Выплата победителю*\n\n"
-                f"👤 Победитель: {mention(user_id)}\n"
-                f"⭐ Отправь: *{stars} звёзд*\n"
-                f"🎁 Приз: {prize_name}\n\n"
-                f"💰 Остаток баланса: *{bal} ⭐*\n\n"
-                f"Нажми на имя пользователя и отправь ему {stars}⭐ через Telegram"
+        await conn.execute(
+            """UPDATE rentals SET owner_id=?, activated_at=?, expires_at=?, active=1
+               WHERE id=?""",
+            (
+                message.from_user.id,
+                now.isoformat(),
+                new_exp.isoformat(),
+                rid,
             ),
-            parse_mode=ParseMode.MARKDOWN,
         )
-    except Exception as e:
-        log.warning(f"Не удалось уведомить владельца о выплате: {e}")
+        await conn.commit()
 
-
-# ══════════════════════════════════════════════════════
-#  Запуск ивента
-# ══════════════════════════════════════════════════════
-
-async def start_event(bot: Bot, etype: str, prize: str, stars: int = 0):
-    global active_event, event_task
-
-    if active_event:
-        await stop_event(bot)
-
-    msg_counts.clear()
-    active_event = {
-        "type":         etype,
-        "prize":        prize,
-        "stars":        stars,
-        "started_at":   datetime.now(),
-        "leader":       None,
-        "leader_since": None,
-        "quiz_answer":  None,
-    }
-
-    stars_txt = f" + *{stars} ⭐*" if stars else ""
-
-    texts = {
-        "last_leader": (
-            f"🐸 *Ивент начался!*\n\n"
-            f"⏰ Цель: продержаться *3 мин без перебива.*\n\n"
-            f"🎁 Приз: *{prize}*{stars_txt}"
-        ),
-        "most_active": (
-            f"💬 *Ивент «Самый активный» начался!*\n\n"
-            f"⏱ *5 минут* — кто напишет больше всех, тот побеждает!\n\n"
-            f"🎁 Приз: *{prize}*{stars_txt}"
-        ),
-        "random_win": (
-            f"🎲 *Ивент «Случайный победитель» начался!*\n\n"
-            f"Напиши хоть одно сообщение за 3 минуты — попадёшь в розыгрыш!\n\n"
-            f"🎁 Приз: *{prize}*{stars_txt}"
-        ),
-        "first_sticker": (
-            f"🎯 *Ивент «Первый стикер» начался!*\n\n"
-            f"Первый кто отправит *любой стикер* — побеждает!\n\n"
-            f"🎁 Приз: *{prize}*{stars_txt}"
-        ),
-        "x2_stars": (
-            f"⭐⭐ *Ивент X2 начался!*\n\n"
-            f"В течение *15 минут* — активный чат!\n\n"
-            f"🎁 Бонусный приз: *{prize}*{stars_txt}"
-        ),
-        "lottery": (
-            f"🎟 *Лотерея началась!*\n\n"
-            f"Напиши любое сообщение за *5 минут* — получишь лотерейный билет!\n\n"
-            f"🎁 Приз: *{prize}*{stars_txt}"
-        ),
-        "reaction_win": (
-            f"❤️ *Ивент «Активность» начался!*\n\n"
-            f"Кто напишет *больше всего сообщений* за 5 минут — победит!\n\n"
-            f"🎁 Приз: *{prize}*{stars_txt}"
-        ),
-    }
-
-    if etype == "quiz":
-        question, answer = random.choice(QUIZ_QUESTIONS)
-        active_event["quiz_answer"] = answer.lower()
-        text = (
-            f"🧠 *Викторина началась!*\n\n"
-            f"❓ Вопрос: *{question}*\n\n"
-            f"Первый правильный ответ побеждает!\n"
-            f"🎁 Приз: *{prize}*{stars_txt}"
-        )
-    else:
-        text = texts.get(etype, f"🐸 *Ивент начался!*\n\n🎁 Приз: *{prize}*{stars_txt}")
-
-    await send_group(bot, text)
-
-    tasks_map = {
-        "last_leader":  lambda: run_last_leader(bot, prize, stars),
-        "most_active":  lambda: run_timed(bot, prize, stars, 300, mode="active"),
-        "random_win":   lambda: run_timed(bot, prize, stars, 180, mode="random"),
-        "x2_stars":     lambda: run_timed(bot, prize, stars, 900, mode="x2"),
-        "lottery":      lambda: run_timed(bot, prize, stars, 300, mode="random"),
-        "reaction_win": lambda: run_timed(bot, prize, stars, 300, mode="active"),
-    }
-    if etype in tasks_map:
-        event_task = asyncio.create_task(tasks_map[etype]())
-
-
-# ══════════════════════════════════════════════════════
-#  Таймеры ивентов
-# ══════════════════════════════════════════════════════
-
-async def run_last_leader(bot: Bot, prize: str, stars: int):
-    global active_event
-    await asyncio.sleep(3)
-    while active_event and active_event["type"] == "last_leader":
-        leader = active_event.get("leader")
-        since  = active_event.get("leader_since")
-        if leader and since:
-            if (datetime.now() - since).total_seconds() >= 180:
-                await declare_winner(bot, leader, prize, stars)
-                return
-        await asyncio.sleep(5)
-
-
-async def run_timed(bot: Bot, prize: str, stars: int, duration: int, mode: str):
-    global active_event
-    await asyncio.sleep(duration)
-    if not active_event:
-        return
-
-    if mode == "x2":
-        await send_group(bot, "⭐ *Ивент X2 завершён!* Спасибо за активность!")
-
-    if not msg_counts:
-        await send_group(bot, "😔 Никто не участвовал. Ивент отменён.")
-        active_event = None
-        return
-
-    winner_id = (
-        max(msg_counts, key=msg_counts.get)
-        if mode == "active"
-        else random.choice(list(msg_counts.keys()))
-    )
-    await declare_winner(bot, winner_id, prize, stars)
-
-
-async def declare_winner(bot: Bot, user_id: int, prize: str, stars: int = 0):
-    global active_event
-    w = mention(user_id)
-    stars_txt = f"\n⭐ Звёзды: *{stars}*" if stars else ""
-
-    await send_group(
-        bot,
-        f"🎉 *Ивент завершён!*\n\n"
-        f"🏆 Победитель: {w}\n"
-        f"🎁 Приз: *{prize}*{stars_txt}",
+    await message.answer(
+        f"✅ Аренда активирована.\n\n"
+        f"Срок: <b>{days} дней</b>\n"
+        f"До: <b>{new_exp.strftime('%d.%m.%Y %H:%M UTC')}</b>\n\n"
+        f"Теперь нажми /start и открой OTDEL."
     )
 
-    active_event = None
-    msg_counts.clear()
 
-    if stars > 0:
-        await payout_winner(bot, user_id, stars, prize)
-    else:
-        caption = (
-            f"🎉 *Поздравляю!*\n"
-            f"🎁 Ты выиграл *{prize}* 🧸 от @godlancet\n"
-            f"✅ Подарок отправлен.\n\n"
-            f"‼️ Пишите сообщения в чате, и получайте возможность так же залутать подарки\n\n"
-        )
-        try:
-            await bot.send_photo(
-                chat_id=user_id,
-                photo="https://i.ibb.co/WN6HrVDx/IMG-20260525-220900-053.jpg",
-                caption=caption,
-                parse_mode=ParseMode.MARKDOWN,
+@dp.callback_query(F.data.startswith("rent:"))
+async def rental_callbacks(call):
+    if call.from_user.id != MASTER_OWNER_ID:
+        await call.answer("Только главный владелец", show_alert=True)
+        return
+
+    action = call.data.split(":", 1)[1]
+    if action == "list":
+        async with aiosqlite.connect(DB_PATH) as conn:
+            cur = await conn.execute(
+                """SELECT code,owner_id,days,expires_at,active
+                   FROM rentals ORDER BY id DESC LIMIT 20"""
             )
-        except Exception:
-            try:
-                await bot.send_message(chat_id=user_id, text=caption, parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                pass
-        try:
-            await bot.send_message(
-                chat_id=OWNER_ID,
-                text=f"✅ Ивент завершён!\nПобедитель: {w}\nПриз: {prize}\n\nНе забудь отправить подарок! 🎁",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            pass
+            rows = await cur.fetchall()
 
-
-async def stop_event(bot: Bot):
-    global active_event, event_task
-    if event_task and not event_task.done():
-        event_task.cancel()
-    event_task = None
-    if active_event:
-        await send_group(bot, "⛔ *Ивент остановлен администратором.*")
-    active_event = None
-    msg_counts.clear()
-
-
-# ══════════════════════════════════════════════════════
-#  Сообщения в группе
-# ══════════════════════════════════════════════════════
-
-async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_event
-
-    msg = update.message
-    if not msg:
-        return
-
-    if not is_allowed_chat(msg.chat.id, msg.chat.username):
-        return
-
-    # Пост из канала → приветствие
-    if msg.sender_chat and msg.sender_chat.type == "channel":
-        try:
-            await msg.reply_text(
-                "Здарова! ⭐\n\n"
-                "Тут ты можешь общаться в комментариях и чате и получить *Мишку* от @godlancet 🐻\n\n"
-                "Просто общайся и получай возможность залутать Мишку или НФТ ПОДАРОК 🎁",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception as e:
-            log.warning(f"Ошибка ответа на пост: {e}")
-        return
-
-    user = msg.from_user
-    if not user:
-        return
-    if user.username:
-        usernames[user.id] = user.username
-
-    if not active_event:
-        return
-
-    # ── Админы не участвуют в ивентах и не могут получить подарок за сообщения ──
-    admins = await get_admin_ids(context.bot, msg.chat.id)
-    if user.id in admins:
-        return
-
-    msg_counts[user.id] += 1
-    etype = active_event["type"]
-
-    if etype == "last_leader":
-        old = active_event.get("leader")
-        if old != user.id:
-            active_event["leader"] = user.id
-            active_event["leader_since"] = datetime.now()
-            if old:
-                await send_group(
-                    context.bot,
-                    f"🔄 *Перебито!*\n\nНовый лидер: {mention(user.id)}. До конца: 3 мин.",
-                )
-            else:
-                await send_group(
-                    context.bot,
-                    f"👑 *Лидер захвачен!*\n\n{mention(user.id)} держит лидерство. "
-                    f"Продержись 3 мин без перебива, чтобы победить!",
-                )
-    elif etype == "first_sticker" and msg.sticker:
-        await declare_winner(context.bot, user.id, active_event["prize"], active_event.get("stars", 0))
-    elif etype == "quiz":
-        ans = active_event.get("quiz_answer", "")
-        if (msg.text or "").lower().strip() == ans:
-            await declare_winner(context.bot, user.id, active_event["prize"], active_event.get("stars", 0))
-
-
-# ══════════════════════════════════════════════════════
-#  ЛС владельца (кастомная сумма пополнения / новый ивент)
-# ══════════════════════════════════════════════════════
-
-async def owner_pm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global pending_prize, waiting_custom_topup
-
-    msg = update.message
-    if msg.chat.type != ChatType.PRIVATE or msg.from_user.id != OWNER_ID:
-        return
-
-    text = msg.text or ""
-
-    if waiting_custom_topup:
-        waiting_custom_topup = False
-        if text.isdigit() and int(text) > 0:
-            amount = int(text)
-            try:
-                await context.bot.send_invoice(
-                    chat_id=OWNER_ID,
-                    title="Пополнение баланса бота",
-                    description=f"Пополнение на {amount} звёзд",
-                    payload=f"topup_{amount}",
-                    currency="XTR",
-                    prices=[LabeledPrice(label=f"{amount} звёзд", amount=amount)],
-                )
-            except Exception as e:
-                await msg.reply_text(f"❌ Ошибка: {e}")
+        if not rows:
+            text = "Аренд пока нет."
         else:
-            await msg.reply_text("❌ Введи корректное число (например: 150)")
+            lines = ["📋 <b>Последние аренды</b>\n"]
+            for code, owner, days, exp, active in rows:
+                who = str(owner) if owner else "не активирована"
+                status = "🟢" if active else "🔴"
+                lines.append(
+                    f"{status} <code>{code}</code> · {days} дн. · {who}\n"
+                    f"   до: {exp or '—'}"
+                )
+            text = "\n".join(lines)
+        await call.message.edit_text(text, reply_markup=rental_kb())
+        await call.answer()
         return
 
-    pending_prize = text
-    await ask_prize_stars(msg)
+    days = RENT_DAYS.get(action)
+    if not days:
+        await call.answer("Неизвестный срок", show_alert=True)
+        return
+
+    code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(10))
+    now = datetime.now(timezone.utc).isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            """INSERT INTO rentals(code,days,created_at,active)
+               VALUES(?,?,?,1)""",
+            (code, days, now),
+        )
+        await conn.commit()
+
+    await call.message.answer(
+        f"🎟 <b>Код аренды создан</b>\n\n"
+        f"Срок: <b>{days} дней</b>\n"
+        f"Код: <code>{code}</code>\n\n"
+        f"Клиент должен отправить боту:\n"
+        f"<code>/rent {code}</code>"
+    )
+    await call.answer("Создано")
 
 
-# ══════════════════════════════════════════════════════
-#  ЛС остальных пользователей
-# ══════════════════════════════════════════════════════
+# ------------------------- Bot chat registration -------------------------
 
-async def other_pm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привет!\n"
-        "Общайся в нашем чате и получай возможность выиграть *Мишку* от @godlancet! 🐻\n\n"
-        "Переходи: @chatlancet",
-        parse_mode=ParseMode.MARKDOWN,
+async def register_chat_from_chat(chat, actor_id: int):
+    if chat.type not in ("group", "supergroup"):
+        return False, "Это не группа/супергруппа."
+    try:
+        admins = await bot.get_chat_administrators(chat.id)
+        creator = next((a for a in admins if a.status == ChatMemberStatus.CREATOR), None)
+        owner_id = creator.user.id if creator else actor_id
+    except Exception:
+        owner_id = actor_id
+    if actor_id not in (MASTER_OWNER_ID, DEVELOPER_ID) and not await has_access(owner_id):
+        return False, "У владельца группы нет активной аренды OTDEL."
+    me = await bot.get_me()
+    try:
+        member = await bot.get_chat_member(chat.id, me.id)
+        if member.status != ChatMemberStatus.ADMINISTRATOR:
+            return False, "Сделай OTDEL администратором группы."
+    except Exception:
+        return False, "Не удалось проверить права OTDEL в группе."
+    await save_chat(chat.id, chat.title or str(chat.id), owner_id)
+    return True, owner_id
+
+@dp.message(Command("connect"), F.chat.type.in_({"group", "supergroup"}))
+async def connect_chat(message: Message):
+    actor = message.from_user.id if message.from_user else 0
+    try:
+        member = await bot.get_chat_member(message.chat.id, actor)
+        if actor not in (MASTER_OWNER_ID, DEVELOPER_ID) and member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            await message.reply("❌ Только администратор может подключить чат.")
+            return
+    except Exception:
+        await message.reply("❌ Не удалось проверить права администратора.")
+        return
+    ok, info = await register_chat_from_chat(message.chat, actor)
+    if ok:
+        await message.reply("✅ <b>Чат подключён к OTDEL.</b>\nОткрой /start у бота и зайди в Mini App.")
+    else:
+        await message.reply(f"❌ {info}")
+
+@dp.my_chat_member()
+async def on_bot_membership_change(event: ChatMemberUpdated):
+    new_status = event.new_chat_member.status
+    if new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR):
+        try:
+            ok, info = await register_chat_from_chat(event.chat, event.from_user.id if event.from_user else 0)
+            if ok:
+                log.info("Chat registered: %s owner=%s", event.chat.id, info)
+        except Exception:
+            log.exception("Failed to register chat %s", event.chat.id)
+    elif new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        await remove_chat(event.chat.id)
+
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def track_messages(message: Message):
+    await remember_member(message)
+    if message.from_user:
+        await upsert_user({"id":message.from_user.id,"username":message.from_user.username,"first_name":message.from_user.first_name,"last_name":message.from_user.last_name,"photo_url":None})
+
+
+# ------------------------- Stars -------------------------
+
+async def send_stars_invoice(user_id: int, payload: str, title: str, stars: int):
+    await bot.send_invoice(
+        chat_id=user_id,
+        title=title[:32],
+        description=f"OTDEL: {title}"[:255],
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label=title[:32], amount=stars)],
     )
 
 
-# ══════════════════════════════════════════════════════
-#  main
-# ══════════════════════════════════════════════════════
+@dp.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(query.id, ok=True)
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("balance",  cmd_balance))
-    app.add_handler(CommandHandler("history",  cmd_history))
-    app.add_handler(CommandHandler("topup",    cmd_topup))
-    app.add_handler(CommandHandler("event",    cmd_event))
-    app.add_handler(CommandHandler("stop",     cmd_stop))
-    app.add_handler(CommandHandler("announce", cmd_announce))
-    app.add_handler(CommandHandler("stats",    cmd_stats))
+@dp.message(F.successful_payment)
+async def on_paid(message: Message):
+    payload = message.successful_payment.invoice_payload
+    stars = message.successful_payment.total_amount
 
-    app.add_handler(CallbackQueryHandler(on_callback))
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT chat_id,item_id FROM purchases WHERE payload=? AND user_id=?",
+            (payload, message.from_user.id),
+        )
+        row = await cur.fetchone()
+        if row:
+            chat_id, item_id = row
+            await conn.execute(
+                "UPDATE purchases SET paid=1 WHERE payload=?",
+                (payload,),
+            )
+            await conn.commit()
+        else:
+            chat_id, item_id = None, None
 
-    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_payment))
+    if item_id in SHOP:
+        name = SHOP[item_id][0]
+        await message.answer(
+            f"✅ Оплата прошла: ⭐ {stars}\n"
+            f"Товар: <b>{name}</b>\n"
+            f"Чат: <code>{chat_id}</code>\n\n"
+            f"Заявка сохранена."
+        )
+    else:
+        await message.answer(f"✅ Оплата прошла: ⭐ {stars}")
 
-    app.add_handler(MessageHandler(
-        filters.ChatType.GROUPS,
-        on_group_message,
-    ))
 
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.User(OWNER_ID) & ~filters.COMMAND,
-        owner_pm,
-    ))
+# ------------------------- Web API -------------------------
 
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & ~filters.User(OWNER_ID) & ~filters.COMMAND,
-        other_pm,
-    ))
+async def api_bootstrap(request):
+    auth = await require_access(request)
+    user = auth["user"]
+    uid = int(user["id"])
+    chats = await get_owner_chats(uid)
+    rental = await get_rental(uid)
+    return web.json_response({
+        "ok": True,
+        "user": {
+            "id": uid,
+            "first_name": user.get("first_name", ""),
+            "last_name": user.get("last_name", ""),
+            "username": user.get("username", ""),
+            "photo_url": user.get("photo_url", ""),
+            "is_master": uid == MASTER_OWNER_ID,
+            "is_developer": uid == DEVELOPER_ID,
+        },
+        "chats": chats,
+        "rental": rental,
+        "shop": [
+            {"id": k, "name": v[0], "price": v[1]}
+            for k, v in SHOP.items()
+        ],
+    })
 
-    log.info("Бот запущен — @chatlancet")
-    app.run_polling(drop_pending_updates=True)
+
+async def api_action(request):
+    auth = await require_access(request)
+    uid = int(auth["user"]["id"])
+
+    try:
+        data = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="JSON required")
+
+    action = str(data.get("action", ""))
+    try:
+        chat_id = int(data.get("chat_id"))
+    except Exception:
+        raise web.HTTPBadRequest(text="chat_id required")
+
+    if not await owns_chat(uid, chat_id):
+        raise web.HTTPForbidden(text="Этот чат не принадлежит текущему владельцу.")
+
+    # Events
+    if action == "event_777":
+        await bot.send_message(chat_id, "🎰 <b>ИВЕНТ 777</b>\nНажимайте на слот и ловите удачу!")
+        for _ in range(3):
+            await bot.send_dice(chat_id, emoji="🎰")
+        return web.json_response({"ok": True, "message": "Ивент 777 запущен"})
+
+    if action == "event_spam3":
+        await bot.send_message(
+            chat_id,
+            "⚡ <b>ПЕРЕБИВ</b>\n"
+            "Ивент запущен на 3 минуты. Пишите как можно активнее!"
+        )
+        return web.json_response({"ok": True, "message": "Перебив запущен"})
+
+    if action == "event_guess":
+        number = secrets.randbelow(100) + 1
+        # Для простоты число живёт в сообщении; полноценный игровой state
+        # можно расширить позже.
+        await bot.send_message(
+            chat_id,
+            f"🔢 <b>УГАДАЙ ЧИСЛО</b>\n"
+            f"Я загадал число от 1 до 100.\n"
+            f"Ивент запущен!"
+        )
+        return web.json_response({"ok": True, "message": "Угадай цифры запущен"})
+
+    # Moderation
+    target_raw = str(data.get("target", "")).strip()
+    if action in {"mute", "unmute", "ban", "unban", "warn", "unwarn"}:
+        target = await resolve_target(chat_id, target_raw)
+        if not target:
+            return web.json_response(
+                {"ok": False, "message": "Пользователь не найден. Используй числовой Telegram ID или @username участника, которого бот уже видел."},
+                status=400,
+            )
+
+        if action == "ban":
+            await bot.ban_chat_member(chat_id, target)
+            msg = "Бан выполнен"
+        elif action == "unban":
+            await bot.unban_chat_member(chat_id, target, only_if_banned=True)
+            msg = "Разбан выполнен"
+        elif action == "mute":
+            await bot.restrict_chat_member(
+                chat_id, target,
+                permissions=__import__("aiogram").types.ChatPermissions(
+                    can_send_messages=False
+                )
+            )
+            msg = "Мут выполнен"
+        elif action == "unmute":
+            await bot.restrict_chat_member(
+                chat_id, target,
+                permissions=__import__("aiogram").types.ChatPermissions(
+                    can_send_messages=True,
+                    can_send_audios=True,
+                    can_send_documents=True,
+                    can_send_photos=True,
+                    can_send_videos=True,
+                    can_send_video_notes=True,
+                    can_send_voice_notes=True,
+                    can_send_polls=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True,
+                )
+            )
+            msg = "Размут выполнен"
+        elif action in {"warn", "unwarn"}:
+            async with aiosqlite.connect(DB_PATH) as conn:
+                cur = await conn.execute(
+                    "SELECT count FROM warnings WHERE chat_id=? AND user_id=?",
+                    (chat_id, target),
+                )
+                row = await cur.fetchone()
+                count = int(row[0]) if row else 0
+                count = max(0, count + (1 if action == "warn" else -1))
+                await conn.execute(
+                    """INSERT INTO warnings(chat_id,user_id,count) VALUES(?,?,?)
+                       ON CONFLICT(chat_id,user_id) DO UPDATE SET count=excluded.count""",
+                    (chat_id, target, count),
+                )
+                await conn.commit()
+            msg = f"Варн {'выдан' if action == 'warn' else 'снят'} · всего: {count}"
+
+        return web.json_response({"ok": True, "message": msg})
+
+    if action == "freeze":
+        from aiogram.types import ChatPermissions
+        await bot.set_chat_permissions(
+            chat_id,
+            ChatPermissions(can_send_messages=False)
+        )
+        return web.json_response({"ok": True, "message": "Чат заморожен"})
+
+    if action == "unfreeze":
+        from aiogram.types import ChatPermissions
+        await bot.set_chat_permissions(
+            chat_id,
+            ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+            )
+        )
+        return web.json_response({"ok": True, "message": "Чат разморожен"})
+
+    if action == "buy":
+        item_id = str(data.get("item", ""))
+        if item_id not in SHOP:
+            return web.json_response({"ok": False, "message": "Товар не найден"}, status=400)
+
+        name, price = SHOP[item_id]
+        payload = f"otdel:{uid}:{chat_id}:{item_id}:{secrets.token_hex(6)}"
+
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await conn.execute(
+                """INSERT INTO purchases(payload,user_id,chat_id,item_id,price,created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (
+                    payload, uid, chat_id, item_id, price,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            await conn.commit()
+
+        await send_stars_invoice(uid, payload, name, price)
+        return web.json_response({
+            "ok": True,
+            "message": "Счёт отправлен в личные сообщения бота."
+        })
+
+    return web.json_response({"ok": False, "message": f"Неизвестное действие: {action}"}, status=400)
+
+
+# ------------------------- Static site -------------------------
+
+async def index_handler(request):
+    return web.FileResponse(STATIC_DIR / "index.html")
+
+
+async def welcome_handler(request):
+    path = STATIC_DIR / "welcome.png"
+    if not path.exists():
+        raise web.HTTPNotFound()
+    return web.FileResponse(path)
+
+
+async def health_handler(request):
+    return web.json_response({"ok": True, "service": "OTDEL"})
+
+
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        resp = web.Response(status=204)
+    else:
+        resp = await handler(request)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
+
+def create_app():
+    app = web.Application(middlewares=[cors_middleware])
+    app.router.add_get("/", index_handler)
+    app.router.add_get("/welcome.png", welcome_handler)
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/api/bootstrap", api_bootstrap)
+    app.router.add_post("/api/action", api_action)
+    app.router.add_route("OPTIONS", "/api/{tail:.*}", lambda request: web.Response(status=204))
+    return app
+
+
+async def main():
+    await init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    app = create_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, WEB_HOST, WEB_PORT)
+    await site.start()
+
+    log.info("OTDEL web: %s:%s", WEB_HOST, WEB_PORT)
+    log.info("Mini App URL: %s", WEBAPP_URL)
+    log.info("Polling started")
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
