@@ -32,7 +32,7 @@ from telegram.ext import (
 )
 
 # ===================== НАСТРОЙКИ =====================
-BOT_TOKEN      = "8888151886:AAENI5rDl_1k02zUfjbwJQoA1JBEkvkc2Rk"
+BOT_TOKEN      = "8746595925:AAFWHNpIPNL0fZHvZp82ppe_qae5mCXiEPQ"
 OWNER_ID       = 8675927241
 GROUP_USERNAME = "sexpunisher"
 GROUP_CHAT_ID  = -1004340867881
